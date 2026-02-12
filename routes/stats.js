@@ -2,98 +2,127 @@ const express = require('express');
 const router = express.Router();
 const supabase = require('../lib/supabase');
 
-// Helper to calculate date ranges
-const getRange = (period) => {
-  const now = new Date();
-  const start = new Date();
-
-  switch (period) {
-    case 'today':
-      start.setHours(0, 0, 0, 0);
-      break;
-    case 'week':
-      start.setDate(now.getDate() - 7);
-      break;
-    case 'month':
-      start.setMonth(now.getMonth() - 1);
-      break;
-    case 'year':
-      start.setFullYear(now.getFullYear() - 1);
-      break;
-    case 'all_time':
-      start.setTime(0); // Epoch
-      break;
-    default:
-      start.setHours(0, 0, 0, 0); // Default to today
-  }
-
-  return { start: start.toISOString(), end: now.toISOString() };
-};
-
 router.get('/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { period } = req.query; // today, week, month, year, all_time
+    const { period } = req.query; // e.g. 'all_time'
+    const entityId = `user:${userId}`;
 
     if (!userId) {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    const { start, end } = getRange(period);
+    // 1. Fetch Daily Stats Rows (Only for the user)
+    // We fetch all rows for 'all_time' statistics or filter by date for others
+    let query = supabase
+      .from('user_daily_stats')
+      .select('date, metrics')
+      .eq('entity_id', entityId)
+      .order('date', { ascending: false });
 
-    // Call the Supabase RPC function
-    const { data: metrics, error: metricsError } = await supabase
-      .rpc('get_user_metrics', {
-        target_user_id: userId,
-        start_date: start,
-        end_date: end
+    // Handle period logic if needed (simplified for this update)
+    if (period === 'today') {
+      const today = new Date().toISOString().split('T')[0];
+      query = query.eq('date', today);
+    } else if (period === 'week') {
+      const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      query = query.gte('date', weekAgo);
+    }
+
+    const { data: dailyRows, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    // 2. Aggregate Data
+    let totalPdfsRead = 0;
+    let totalReadingTime = 0; // seconds
+    let totalEngagementTime = 0; // seconds
+    let allInteractions = [];
+
+    // Map to aggregate counts for "Top PDFs"
+    const pdfCounts = {};
+
+    (dailyRows || []).forEach(row => {
+      const metrics = row.metrics || {};
+
+      // A. Engagement Time
+      totalEngagementTime += (metrics.total_engagement_sec || 0);
+
+      // B. PDFs
+      const pdfs = metrics.pdfs || [];
+      pdfs.forEach(pdf => {
+        // pdf: { url, count, duration, last_read, title }
+        totalReadingTime += (pdf.duration || 0);
+        totalPdfsRead += (pdf.count || 0);
+
+        // Add to interactions list (for History)
+        allInteractions.push({
+          url: pdf.url,
+          title: pdf.title || 'Unknown PDF',
+          date: pdf.last_read || row.date,
+          count: pdf.count,
+          duration: pdf.duration
+        });
+
+        // Add to counts map (for Top Content)
+        if (!pdfCounts[pdf.url]) {
+          pdfCounts[pdf.url] = { count: 0, title: pdf.title, url: pdf.url };
+        }
+        pdfCounts[pdf.url].count += (pdf.count || 0);
       });
+    });
 
-    if (metricsError) throw metricsError;
+    // 3. Process Lists
+    // Sort history by most recent
+    allInteractions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Get User's Top Content
-    const { data: topContent, error: topContentError } = await supabase
-      .rpc('get_user_top_content', {
-        target_user_id: userId,
-        content_type: 'pdf_read',
-        limit_count: 5
-      });
+    // Sort top content by count
+    const topContent = Object.values(pdfCounts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5);
 
-    if (topContentError) throw topContentError;
+    // 4. Calculate Streak
+    // Logic: Consecutive days present in dailyRows (which are unique by date)
+    // Since rows are ordered by date DESC
+    let streak = 0;
+    if (dailyRows && dailyRows.length > 0) {
+      const todayStr = new Date().toISOString().split('T')[0];
+      const yesterdayStr = new Date(Date.now() - 86400000).toISOString().split('T')[0];
 
-    // Get User Streak
-    const { data: streak, error: streakError } = await supabase
-      .rpc('get_user_streak', {
-        target_user_id: userId
-      });
+      // Check if user was active today or yesterday to start streak
+      const mostRecentDate = dailyRows[0].date;
 
-    if (streakError) throw streakError;
+      if (mostRecentDate === todayStr || mostRecentDate === yesterdayStr) {
+        streak = 1;
+        let currentDate = new Date(mostRecentDate);
 
-    // Get Recent History
-    const { data: history, error: historyError } = await supabase
-      .from('analytics_events')
-      .select('url, created_at, event_data')
-      .eq('user_id', userId)
-      .eq('event_type', 'pdf_read')
-      .order('created_at', { ascending: false })
-      .limit(20);
+        for (let i = 1; i < dailyRows.length; i++) {
+          const prevDate = new Date(dailyRows[i].date);
+          const diffTime = Math.abs(currentDate - prevDate);
+          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
-    if (historyError) throw historyError;
-
-    // Format history for frontend
-    const formattedHistory = history.map(item => ({
-      url: item.url,
-      date: item.created_at,
-      duration: item.event_data?.duration_sec || 0
-    }));
+          if (diffDays === 1) {
+            streak++;
+            currentDate = prevDate;
+          } else {
+            break; // Gap found
+          }
+        }
+      }
+    }
 
     res.status(200).json({
-      period,
-      range: { start, end },
-      metrics,
-      top_pdfs: topContent,
+      period: period || 'all_time',
+      metrics: {
+        pdfs_read_count: totalPdfsRead,
+        reading_time_seconds: totalReadingTime,
+        engagement_time_seconds: totalEngagementTime
+      },
       streak,
-      history: formattedHistory
+      history: allInteractions.slice(0, 50),
+      top_pdfs: topContent
     });
 
   } catch (err) {
