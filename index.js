@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const streamRoute = require('./routes/stream');
+const collectRoute = require('./routes/collect');
 const statsRoute = require('./routes/stats');
 const adminRoute = require('./routes/admin');
 const clientRoute = require('./routes/client');
@@ -34,7 +34,7 @@ app.get('/health', (req, res) => {
   res.status(200).send('OK');
 });
 
-app.use('/stream', streamRoute);
+app.use('/sync', collectRoute);
 app.use('/client', clientRoute);
 app.use('/stats', statsRoute);
 app.use('/admin', adminRoute);

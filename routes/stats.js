@@ -12,15 +12,21 @@ router.get('/:userId', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // 1. Fetch Daily Stats Rows (Only for the user)
-    // We fetch all rows for 'all_time' statistics or filter by date for others
+    // 1. Fetch Consolidated Trends (New optimized table)
+    const { data: trendData } = await supabase
+      .from('user_activity_trends')
+      .select('trends')
+      .eq('entity_id', entityId)
+      .single();
+
+    // 2. Fetch Daily Stats Rows for Detailed Aggregates (PDFs, History)
     let query = supabase
       .from('user_daily_stats')
       .select('date, metrics')
       .eq('entity_id', entityId)
       .order('date', { ascending: false });
 
-    // Handle period logic if needed (simplified for this update)
+    // Handle period logic if needed
     if (period === 'today') {
       const today = new Date().toISOString().split('T')[0];
       query = query.eq('date', today);
@@ -35,7 +41,7 @@ router.get('/:userId', async (req, res) => {
       throw error;
     }
 
-    // 2. Aggregate Data
+    // 3. Aggregate Data
     let totalPdfsRead = 0;
     let totalReadingTime = 0; // seconds
     let totalEngagementTime = 0; // seconds
@@ -47,17 +53,16 @@ router.get('/:userId', async (req, res) => {
     (dailyRows || []).forEach(row => {
       const metrics = row.metrics || {};
 
-      // A. Engagement Time
-      totalEngagementTime += (metrics.total_engagement_sec || 0);
+      // A. Engagement Time (Fixed naming mismatch to match DB: engagement_time_seconds)
+      totalEngagementTime += (metrics.engagement_time_seconds || 0);
 
       // B. PDFs
       const pdfs = metrics.pdfs || [];
       pdfs.forEach(pdf => {
-        // pdf: { url, count, duration, last_read, title }
         totalReadingTime += (pdf.duration || 0);
         totalPdfsRead += (pdf.count || 0);
 
-        // Add to interactions list (for History)
+        // Add to interactions list
         allInteractions.push({
           url: pdf.url,
           title: pdf.title || 'Unknown PDF',
@@ -66,7 +71,6 @@ router.get('/:userId', async (req, res) => {
           duration: pdf.duration
         });
 
-        // Add to counts map (for Top Content)
         if (!pdfCounts[pdf.url]) {
           pdfCounts[pdf.url] = { count: 0, title: pdf.title, url: pdf.url };
         }
@@ -74,8 +78,7 @@ router.get('/:userId', async (req, res) => {
       });
     });
 
-    // 3. Process Lists
-    // Sort history by most recent
+    // 4. Process Lists
     allInteractions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
     // Sort top content by count
@@ -83,15 +86,11 @@ router.get('/:userId', async (req, res) => {
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
 
-    // 4. Calculate Streak
-    // Logic: Consecutive days present in dailyRows (which are unique by date)
-    // Since rows are ordered by date DESC
+    // 5. Calculate Streak
     let streak = 0;
     if (dailyRows && dailyRows.length > 0) {
       const todayStr = new Date().toISOString().split('T')[0];
       const yesterdayStr = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-
-      // Check if user was active today or yesterday to start streak
       const mostRecentDate = dailyRows[0].date;
 
       if (mostRecentDate === todayStr || mostRecentDate === yesterdayStr) {
@@ -117,10 +116,12 @@ router.get('/:userId', async (req, res) => {
       period: period || 'all_time',
       metrics: {
         pdfs_read_count: totalPdfsRead,
+        unique_pdfs_count: Object.keys(pdfCounts).length, // How many different PDFs touched
         reading_time_seconds: totalReadingTime,
         engagement_time_seconds: totalEngagementTime
       },
       streak,
+      trends: trendData?.trends || {}, // Return consolidated datewise trends
       history: allInteractions.slice(0, 50),
       top_pdfs: topContent
     });
@@ -132,3 +133,4 @@ router.get('/:userId', async (req, res) => {
 });
 
 module.exports = router;
+
