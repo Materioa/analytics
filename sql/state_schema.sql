@@ -71,7 +71,33 @@ BEGIN
   -- B. Determine Date (Use event timestamp if provided, fallback to CURRENT_DATE)
   v_today := COALESCE((p_data->>'timestamp')::date, CURRENT_DATE);
 
-  -- C. Upsert Daily Record
+  -- [FIX] C. Log RAW Event to analytics_events first
+  -- This ensures data reflects in tables used by other RPCs
+  INSERT INTO analytics_events (
+    user_id, 
+    anonymous_id, 
+    event_type, 
+    event_data, 
+    url, 
+    referrer, 
+    user_agent, 
+    ip_address, 
+    session_id,
+    client_timestamp
+  ) VALUES (
+    (CASE WHEN p_user_id ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' THEN p_user_id::uuid ELSE NULL END),
+    p_anonymous_id,
+    p_event_type,
+    p_data,
+    p_data->>'url',
+    p_data->>'referrer',
+    p_data->>'user_agent',
+    p_data->>'ip_address',
+    p_data->>'sessionId',
+    (p_data->>'timestamp')::timestamp with time zone
+  );
+
+  -- D. Upsert Daily Record
   BEGIN
     -- Try direct update first
     UPDATE user_daily_stats 
@@ -93,7 +119,7 @@ BEGIN
       WHERE entity_id = v_entity_id AND date = v_today;
   END;
 
-  -- D. Lock Row for Reading JSON
+  -- E. Lock Row for Reading JSON
   SELECT metrics INTO v_state
   FROM user_daily_stats
   WHERE entity_id = v_entity_id AND date = v_today
@@ -101,7 +127,7 @@ BEGIN
 
   IF v_state IS NULL THEN v_state := '{}'::jsonb; END IF;
 
-  -- E. specific logic based on event type
+  -- F. specific logic based on event type
   -- CASE 1: PDF READ (or open/close)
   IF p_event_type IN ('pdf_read', 'pdf_open', 'pdf_close') THEN
     v_key := 'pdfs';
@@ -162,7 +188,7 @@ BEGIN
     v_state := jsonb_set(v_state, array[v_key], v_new_list);
   END IF;
 
-  -- F. Update Specific Time Metrics
+  -- G. Update Specific Time Metrics
   -- 1. PDF Reading Time
   IF p_event_type IN ('pdf_close', 'pdf_read') AND (p_data ? 'duration_sec') THEN
      v_state := jsonb_set(
@@ -181,16 +207,16 @@ BEGIN
      );
   END IF;
 
-  -- G. Save Daily Record
+  -- H. Save Daily Record
   UPDATE user_daily_stats
   SET metrics = v_state, updated_at = NOW()
   WHERE entity_id = v_entity_id AND date = v_today;
 
-  -- H. Update Trends Summary (Consolidated history in JSONB)
+  -- I. Update Trends Summary (Consolidated history in JSONB)
   v_summary := jsonb_build_object(
     'reading_time', COALESCE((v_state->>'reading_time_seconds')::int, 0),
     'engagement_time', COALESCE((v_state->>'engagement_time_seconds')::int, 0),
-    'pdfs_read', (SELECT count(*) FROM jsonb_array_elements(v_state->'pdfs'))
+    'pdfs_read', (SELECT count(*) FROM jsonb_array_elements(COALESCE(v_state->'pdfs', '[]'::jsonb)))
   );
 
   INSERT INTO user_activity_trends (entity_id, user_id, trends)

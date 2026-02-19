@@ -22,13 +22,19 @@ router.post('/', async (req, res) => {
       return res.status(400).json({ error: 'Missing identity: userId or anonymousId required' });
     }
 
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    const ua = req.headers['user-agent'];
+
     // Process each event using the new consolidated daily tracking RPC
     const promises = events.map(async (event) => {
       // Prepare data object: ensure duration_sec is present if available
-      // For 'pdf_close', frontend should send delta duration, but if it sends total, we rely on updated DB logic
       const eventData = {
         ...event.data,
         url: event.url,
+        referrer: event.referrer,
+        sessionId: event.sessionId,
+        ip_address: ip,
+        user_agent: ua,
         timestamp: event.timestamp || new Date().toISOString()
       };
 
