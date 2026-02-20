@@ -1,7 +1,6 @@
--- Function to get admin level stats
--- Run this in Supabase SQL Editor
+-- Admin Stats Refactored to use user_daily_stats json blobs
 
--- 1. Get Active User Counts (Authenticated vs Anonymous)
+-- 1. Get Active User Counts
 create or replace function get_active_users_summary(
   start_date timestamp with time zone, 
   end_date timestamp with time zone
@@ -14,34 +13,31 @@ declare
   auth_users int;
   anon_users int;
 begin
-  -- Count distinct logged-in users
+  -- Count users with 'user:' prefix
   select count(distinct user_id)
   into auth_users
-  from analytics_events
-  where created_at >= start_date 
-  and created_at <= end_date
-  and user_id is not null;
+  from user_daily_stats
+  where date >= start_date::date 
+  and date <= end_date::date
+  and entity_id like 'user:%';
 
-  -- Count distinct anonymous users (who haven't logged in during this period)
-  -- We count anonymous_ids that appear in rows where user_id is NULL
-  -- Note: This is an approximation. A user could be anon then login in the same period.
-  select count(distinct anonymous_id)
+  -- Count users with 'anon:' prefix
+  select count(distinct entity_id)
   into anon_users
-  from analytics_events
-  where created_at >= start_date 
-  and created_at <= end_date
-  and user_id is null;
+  from user_daily_stats
+  where date >= start_date::date 
+  and date <= end_date::date
+  and entity_id like 'anon:%';
 
   return json_build_object(
     'authenticated_users', auth_users,
     'anonymous_users', anon_users,
-    'total_active_devices', (select count(distinct anonymous_id) from analytics_events where created_at >= start_date and created_at <= end_date)
+    'total_active_entities', (select count(distinct entity_id) from user_daily_stats where date >= start_date::date and date <= end_date::date)
   );
 end;
 $$;
 
 -- 2. Get Feature Usage Stats
--- Assumes event_type = 'feature_usage' and event_data->>'feature' contains the feature name
 create or replace function get_feature_usage_stats(
   start_date timestamp with time zone, 
   end_date timestamp with time zone
@@ -56,19 +52,19 @@ as $$
 begin
   return query
   select 
-    event_data->>'feature' as feature_name,
+    e->'data'->>'feature' as feature_name,
     count(*) as usage_count
-  from analytics_events
-  where event_type = 'feature_usage'
-  and created_at >= start_date 
-  and created_at <= end_date
-  group by event_data->>'feature'
+  from user_daily_stats,
+       jsonb_array_elements(metrics->'events') as e
+  where date >= start_date::date 
+  and date <= end_date::date
+  and e->>'type' = 'feature_usage'
+  group by feature_name
   order by usage_count desc;
 end;
 $$;
 
 -- 3. Get Interaction Stats
--- Assumes event_type = 'interaction' and event_data->>'category' contains the interaction type (e.g., 'pdf_scroll', 'ai_followup')
 create or replace function get_interaction_stats(
   start_date timestamp with time zone, 
   end_date timestamp with time zone
@@ -83,13 +79,14 @@ as $$
 begin
   return query
   select 
-    event_data->>'category' as interaction_category,
+    e->'data'->>'category' as interaction_category,
     count(*) as interaction_count
-  from analytics_events
-  where event_type = 'interaction'
-  and created_at >= start_date 
-  and created_at <= end_date
-  group by event_data->>'category'
+  from user_daily_stats,
+       jsonb_array_elements(metrics->'events') as e
+  where date >= start_date::date 
+  and date <= end_date::date
+  and e->>'type' = 'interaction'
+  group by interaction_category
   order by interaction_count desc;
 end;
 $$;

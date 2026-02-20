@@ -1,8 +1,7 @@
--- Function to get user metrics for a specific period
--- Run this in Supabase SQL Editor
+-- User Metrics RPC Refactored (UUID Reverted)
 
 create or replace function get_user_metrics(
-  target_user_id uuid, 
+  target_user_id uuid, -- Reverted to UUID
   start_date timestamp with time zone, 
   end_date timestamp with time zone
 )
@@ -15,34 +14,24 @@ declare
   pdfs_read_count int;
   total_reading_time int;
 begin
-  -- Calculate Engagement Time (sum of duration in 'user_engagement' events)
-  -- Uses 'duration_sec' field from event_data
-  select coalesce(sum(cast(event_data->>'duration_sec' as int)), 0)
-  into total_engagement
-  from analytics_events
-  where user_id = target_user_id
-  and event_type = 'user_engagement'
-  and created_at >= start_date
-  and created_at <= end_date;
+  select 
+    coalesce(sum((metrics->>'engagement_time_seconds')::int), 0),
+    coalesce(sum((metrics->>'reading_time_seconds')::int), 0)
+  into total_engagement, total_reading_time
+  from user_daily_stats
+  where (user_id = target_user_id OR entity_id = 'user:' || target_user_id::text)
+  and date >= start_date::date
+  and date <= end_date::date;
 
-  -- Calculate PDFs Read Count (count of 'pdf_read' events)
+  -- Count pdf_read events from the array
   select count(*)
   into pdfs_read_count
-  from analytics_events
-  where user_id = target_user_id
-  and event_type = 'pdf_read'
-  and created_at >= start_date
-  and created_at <= end_date;
-
-  -- Calculate Reading Time (sum of duration in 'pdf_read' events)
-  -- Uses 'duration_sec' field from event_data
-  select coalesce(sum(cast(event_data->>'duration_sec' as int)), 0)
-  into total_reading_time
-  from analytics_events
-  where user_id = target_user_id
-  and event_type = 'pdf_read'
-  and created_at >= start_date
-  and created_at <= end_date;
+  from user_daily_stats,
+       jsonb_array_elements(metrics->'events') as e
+  where (user_id = target_user_id OR entity_id = 'user:' || target_user_id::text)
+  and e->>'type' = 'pdf_read'
+  and date >= start_date::date
+  and date <= end_date::date;
 
   return json_build_object(
     'engagement_time_seconds', total_engagement,
@@ -51,4 +40,3 @@ begin
   );
 end;
 $$;
-

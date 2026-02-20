@@ -1,5 +1,6 @@
+-- Final RPCs Refactored for user_daily_stats (UUID Reverted)
+
 -- 6. Global Engagement Stats (Admin)
--- Total reading time across all users
 create or replace function get_global_engagement(
   start_date timestamp with time zone, 
   end_date timestamp with time zone
@@ -11,21 +12,19 @@ as $$
 declare
   total_time bigint;
 begin
-  select coalesce(sum(cast(event_data->>'duration' as int)), 0)
+  select coalesce(sum((metrics->>'reading_time_seconds')::int + (metrics->>'engagement_time_seconds')::int), 0)
   into total_time
-  from analytics_events
-  where event_type in ('engagement', 'pdf_read')
-  and created_at >= start_date 
-  and created_at <= end_date;
+  from user_daily_stats
+  where date >= start_date::date 
+  and date <= end_date::date;
 
   return json_build_object('total_engagement_seconds', total_time);
 end;
 $$;
 
 -- 7. Top Content (Admin)
--- Top performing PDFs or Posts based on view count
 create or replace function get_top_content(
-  content_type text, -- 'pdf_read' or 'post_view'
+  content_type text, 
   start_date timestamp with time zone, 
   end_date timestamp with time zone,
   limit_count int default 10
@@ -40,22 +39,22 @@ as $$
 begin
   return query
   select 
-    event_data->>'pdfId' as content_id, -- Assumes pdfId for pdfs, could be postId for posts
+    e->'data'->>'pdfId' as content_id,
     count(*) as view_count
-  from analytics_events
-  where event_type = content_type
-  and created_at >= start_date 
-  and created_at <= end_date
-  group by event_data->>'pdfId'
+  from user_daily_stats,
+       jsonb_array_elements(metrics->'events') as e
+  where date >= start_date::date 
+  and date <= end_date::date
+  and e->>'type' = content_type
+  group by content_id
   order by view_count desc
   limit limit_count;
 end;
 $$;
 
 -- 8. User's Top Content (User Dashboard)
--- "Your top PDF's you read x amount of times"
 create or replace function get_user_top_content(
-  target_user_id uuid,
+  target_user_id uuid, -- Reverted to UUID
   content_type text,
   limit_count int default 5
 )
@@ -69,21 +68,20 @@ as $$
 begin
   return query
   select 
-    event_data->>'pdfId' as content_id,
+    e->'data'->>'pdfId' as content_id,
     count(*) as view_count
-  from analytics_events
-  where user_id = target_user_id
-  and event_type = content_type
-  group by event_data->>'pdfId'
+  from user_daily_stats,
+       jsonb_array_elements(metrics->'events') as e
+  where (user_id = target_user_id OR entity_id = 'user:' || target_user_id::text)
+  and e->>'type' = content_type
+  group by content_id
   order by view_count desc
   limit limit_count;
 end;
 $$;
 
 -- 9. User Streak (User Dashboard)
--- "Show streak - motivates to read everyday"
--- Calculates consecutive days with at least one event
-create or replace function get_user_streak(target_user_id uuid)
+create or replace function get_user_streak(target_user_id uuid) -- Reverted to UUID
 returns int
 language plpgsql
 security definer
@@ -91,32 +89,28 @@ as $$
 declare
   streak int := 0;
   last_date date := current_date;
-  check_date date;
-  has_activity boolean;
+  v_entity_id text := 'user:' || target_user_id::text;
 begin
-  -- Check today first
-  perform 1 from analytics_events 
-  where user_id = target_user_id 
-  and created_at::date = current_date;
-  
-  if found then
-    streak := 1;
-  else
-    streak := 0;
-  end if;
-
-  -- Check previous days
+  -- Check activity from most recent day backwards
   loop
-    last_date := last_date - interval '1 day';
-    
-    perform 1 from analytics_events 
-    where user_id = target_user_id 
-    and created_at::date = last_date;
+    perform 1 from user_daily_stats 
+    where (user_id = target_user_id OR entity_id = v_entity_id)
+    and date = last_date;
     
     if found then
       streak := streak + 1;
+      last_date := last_date - interval '1 day';
     else
-      exit; -- Break streak on first missing day
+      -- If we didn't find activity today, check if they had activity yesterday to continue streak
+      if streak = 0 then
+          last_date := last_date - interval '1 day';
+          perform 1 from user_daily_stats 
+          where (user_id = target_user_id OR entity_id = v_entity_id)
+          and date = last_date;
+          if not found then exit; end if;
+      else
+          exit;
+      end if;
     end if;
   end loop;
 

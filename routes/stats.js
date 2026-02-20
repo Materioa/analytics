@@ -12,21 +12,14 @@ router.get('/:userId', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // 1. Fetch Consolidated Trends (New optimized table)
-    const { data: trendData } = await supabase
-      .from('user_activity_trends')
-      .select('trends')
-      .eq('entity_id', entityId)
-      .single();
-
-    // 2. Fetch Daily Stats Rows for Detailed Aggregates (PDFs, History)
+    // 1. Fetch Daily Stats Rows for Detailed Aggregates (PDFs, History)
     let query = supabase
       .from('user_daily_stats')
       .select('date, metrics')
       .eq('entity_id', entityId)
       .order('date', { ascending: false });
 
-    // Handle period logic if needed
+    // Handle period logic
     if (period === 'today') {
       const today = new Date().toISOString().split('T')[0];
       query = query.eq('date', today);
@@ -41,44 +34,57 @@ router.get('/:userId', async (req, res) => {
       throw error;
     }
 
-    // 3. Aggregate Data
+    // 2. Aggregate Data
     let totalPdfsRead = 0;
     let totalReadingTime = 0; // seconds
     let totalEngagementTime = 0; // seconds
     let allInteractions = [];
-
-    // Map to aggregate counts for "Top PDFs"
+    const trends = {};
     const pdfCounts = {};
 
     (dailyRows || []).forEach(row => {
       const metrics = row.metrics || {};
+      const events = metrics.events || [];
 
-      // A. Engagement Time (Fixed naming mismatch to match DB: engagement_time_seconds)
+      // Add to trends for this date
+      trends[row.date] = {
+        reading_time: metrics.reading_time_seconds || 0,
+        engagement_time: metrics.engagement_time_seconds || 0,
+        pdfs_read: 0 // Will increment below
+      };
+
+      // Summary totals
       totalEngagementTime += (metrics.engagement_time_seconds || 0);
+      totalReadingTime += (metrics.reading_time_seconds || 0);
 
-      // B. PDFs
-      const pdfs = metrics.pdfs || [];
-      pdfs.forEach(pdf => {
-        totalReadingTime += (pdf.duration || 0);
-        totalPdfsRead += (pdf.count || 0);
+      // Process individual events for detailed lists
+      events.forEach(event => {
+        if (event.type === 'pdf_read' || event.type === 'pdf_open') {
+          const data = event.data || {};
+          const pdfUrl = data.url;
+          if (!pdfUrl) return;
 
-        // Add to interactions list
-        allInteractions.push({
-          url: pdf.url,
-          title: pdf.title || 'Unknown PDF',
-          date: pdf.last_read || row.date,
-          count: pdf.count,
-          duration: pdf.duration
-        });
+          totalPdfsRead++;
+          trends[row.date].pdfs_read++;
 
-        if (!pdfCounts[pdf.url]) {
-          pdfCounts[pdf.url] = { count: 0, title: pdf.title, url: pdf.url };
+          if (!pdfCounts[pdfUrl]) {
+            pdfCounts[pdfUrl] = { count: 0, title: data.title || 'Unknown PDF', url: pdfUrl };
+          }
+          pdfCounts[pdfUrl].count++;
+
+          // Add to history if it's a "read" or "open"
+          allInteractions.push({
+            url: pdfUrl,
+            title: data.title || 'Unknown PDF',
+            date: event.ts || row.date,
+            type: event.type,
+            duration: data.duration_sec || 0
+          });
         }
-        pdfCounts[pdf.url].count += (pdf.count || 0);
       });
     });
 
-    // 4. Process Lists
+    // 3. Process Lists
     allInteractions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
     // Sort top content by count
@@ -86,7 +92,7 @@ router.get('/:userId', async (req, res) => {
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
 
-    // 5. Calculate Streak
+    // 4. Calculate Streak
     let streak = 0;
     if (dailyRows && dailyRows.length > 0) {
       const todayStr = new Date().toISOString().split('T')[0];
@@ -116,12 +122,12 @@ router.get('/:userId', async (req, res) => {
       period: period || 'all_time',
       metrics: {
         pdfs_read_count: totalPdfsRead,
-        unique_pdfs_count: Object.keys(pdfCounts).length, // How many different PDFs touched
+        unique_pdfs_count: Object.keys(pdfCounts).length,
         reading_time_seconds: totalReadingTime,
         engagement_time_seconds: totalEngagementTime
       },
       streak,
-      trends: trendData?.trends || {}, // Return consolidated datewise trends
+      trends,
       history: allInteractions.slice(0, 50),
       top_pdfs: topContent
     });

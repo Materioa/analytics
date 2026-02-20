@@ -4,7 +4,11 @@ const supabase = require('../lib/supabase');
 
 router.post('/', async (req, res) => {
   try {
-    const { userId, anonymousId, events } = req.body;
+    let { userId, anonymousId, events } = req.body;
+
+    // Sanitize identity fields to ensure they are true null/undefined if passed as strings
+    if (userId === 'undefined' || userId === 'null' || userId === '') userId = null;
+    if (anonymousId === 'undefined' || anonymousId === 'null' || anonymousId === '') anonymousId = null;
 
     console.log(`[Stream API] Received payload. User: ${userId}, Anon: ${anonymousId}, Events: ${events?.length}`);
 
