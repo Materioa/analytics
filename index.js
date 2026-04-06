@@ -5,7 +5,6 @@ const collectRoute = require('./routes/collect');
 const statsRoute = require('./routes/stats');
 const adminRoute = require('./routes/admin');
 const clientRoute = require('./routes/client');
-const recommendationsRoute = require('./routes/recommendations');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -38,7 +37,6 @@ app.use('/sync', collectRoute);
 app.use('/client', clientRoute);
 app.use('/stats', statsRoute);
 app.use('/admin', adminRoute);
-app.use('/recommendations', recommendationsRoute);
 
 // Error handling
 app.use((err, req, res, next) => {

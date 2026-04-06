@@ -44,7 +44,7 @@ router.post('/', async (req, res) => {
 
       // Call Supabase RPC
       // Note: userId can be null for anonymous requests
-      const { error } = await supabase.rpc('track_activity', {
+      const { data, error } = await supabase.rpc('track_activity', {
         p_user_id: userId || null,
         p_anonymous_id: anonymousId,
         p_event_type: event.type,
@@ -52,15 +52,37 @@ router.post('/', async (req, res) => {
       });
 
       if (error) {
-        console.error('Track Activity RPC Error:', error);
+        console.error(`[Stream API] EVENT LOST - Track Activity RPC failed for ${event.type}:`, {
+          error: error.message,
+          code: error.code,
+          userId: userId,
+          anonymousId: anonymousId,
+          eventType: event.type,
+          timestamp: eventData.timestamp
+        });
+        throw error; // Propagate error to fail the batch
       } else {
-        // console.log(`[Stream API] Event ${event.type} processed successfully`);
+        console.log(`[Stream API] ✓ Event ${event.type} stored successfully to user_daily_stats`);
       }
     });
 
-    await Promise.all(promises);
+    const results = await Promise.allSettled(promises);
+    
+    // Track any failed events
+    const failures = results.filter(r => r.status === 'rejected');
+    if (failures.length > 0) {
+      console.warn(`[Stream API] ${failures.length} out of ${events.length} events FAILED TO PERSIST`);
+      return res.status(207).json({ 
+        message: 'Partial failure - some events not persisted',
+        processed: events.length - failures.length,
+        failed: failures.length
+      });
+    }
 
-    res.status(200).json({ message: 'Events processed successfully' });
+    res.status(200).json({ 
+      message: 'Events processed successfully',
+      processed: events.length
+    });
   } catch (err) {
     console.error('Server Error:', err);
     res.status(500).json({ error: 'Internal Server Error' });
