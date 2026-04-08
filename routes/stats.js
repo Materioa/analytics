@@ -81,6 +81,24 @@ router.get('/:userId', async (req, res) => {
             duration: data.duration_sec || 0
           });
         }
+
+        // Also capture duration from pdf_close events to pair with opens
+        if (event.type === 'pdf_close') {
+          const data = event.data || {};
+          const pdfUrl = data.url;
+          if (!pdfUrl) return;
+
+          const closeDuration = data.duration_sec || 0;
+          if (closeDuration > 0) {
+            // Find the most recent matching pdf_open in allInteractions and update its duration
+            for (let i = allInteractions.length - 1; i >= 0; i--) {
+              if (allInteractions[i].url === pdfUrl && allInteractions[i].duration === 0) {
+                allInteractions[i].duration = closeDuration;
+                break;
+              }
+            }
+          }
+        }
       });
     });
 

@@ -4,13 +4,14 @@ const supabase = require('../lib/supabase');
 
 router.post('/', async (req, res) => {
   try {
-    let { userId, anonymousId, events } = req.body;
+    let { userId, anonymousId, deviceFingerprint, events } = req.body;
 
     // Sanitize identity fields to ensure they are true null/undefined if passed as strings
     if (userId === 'undefined' || userId === 'null' || userId === '') userId = null;
     if (anonymousId === 'undefined' || anonymousId === 'null' || anonymousId === '') anonymousId = null;
+    if (deviceFingerprint === 'undefined' || deviceFingerprint === 'null' || deviceFingerprint === '') deviceFingerprint = null;
 
-    console.log(`[Stream API] Received payload. User: ${userId}, Anon: ${anonymousId}, Events: ${events?.length}`);
+    console.log(`[Stream API] Received payload. User: ${userId}, Anon: ${anonymousId}, DFP: ${deviceFingerprint}, Events: ${events?.length}`);
 
     if (events && Array.isArray(events)) {
       events.forEach(e => console.log(`[Stream API] Event Type: ${e.type}`));
@@ -39,6 +40,7 @@ router.post('/', async (req, res) => {
         sessionId: event.sessionId,
         ip_address: ip,
         user_agent: ua,
+        device_fingerprint: deviceFingerprint || event.deviceFingerprint || null,
         timestamp: event.timestamp || new Date().toISOString()
       };
 
