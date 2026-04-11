@@ -35,64 +35,60 @@ router.get('/:userId', async (req, res) => {
     }
 
     // 2. Aggregate Data
-    let totalPdfsRead = 0;
-    let totalReadingTime = 0; // seconds
-    let totalEngagementTime = 0; // seconds
+    let totalReadingTime = 0;     // seconds (accumulated from pdf_close durations)
+    let totalEngagementTime = 0;  // seconds
     let allInteractions = [];
     const trends = {};
-    const pdfCounts = {};
+    const globalPdfsRead = {};    // Merged pdfs_read map across all days
 
     (dailyRows || []).forEach(row => {
       const metrics = row.metrics || {};
       const events = metrics.events || [];
+      const dayPdfsRead = metrics.pdfs_read || {};
 
       // Add to trends for this date
       trends[row.date] = {
         reading_time: metrics.reading_time_seconds || 0,
         engagement_time: metrics.engagement_time_seconds || 0,
-        pdfs_read: 0 // Will increment below
+        pdfs_read: Object.keys(dayPdfsRead).length
       };
 
-      // Summary totals
+      // Summary totals — these are already accumulated per-day by the RPC
       totalEngagementTime += (metrics.engagement_time_seconds || 0);
       totalReadingTime += (metrics.reading_time_seconds || 0);
 
-      // Process individual events for detailed lists
+      // Merge daily pdfs_read into global map
+      for (const [title, count] of Object.entries(dayPdfsRead)) {
+        if (globalPdfsRead[title]) {
+          globalPdfsRead[title] += (typeof count === 'number' ? count : 1);
+        } else {
+          globalPdfsRead[title] = (typeof count === 'number' ? count : 1);
+        }
+      }
+
+      // Process individual events for detailed interaction history
       events.forEach(event => {
         if (event.type === 'pdf_read' || event.type === 'pdf_open') {
           const data = event.data || {};
-          const pdfUrl = data.url;
-          if (!pdfUrl) return;
+          const pdfTitle = data.title || 'Unknown PDF';
 
-          totalPdfsRead++;
-          trends[row.date].pdfs_read++;
-
-          if (!pdfCounts[pdfUrl]) {
-            pdfCounts[pdfUrl] = { count: 0, title: data.title || 'Unknown PDF', url: pdfUrl };
-          }
-          pdfCounts[pdfUrl].count++;
-
-          // Add to history if it's a "read" or "open"
           allInteractions.push({
-            url: pdfUrl,
-            title: data.title || 'Unknown PDF',
+            title: pdfTitle,
             date: event.ts || row.date,
             type: event.type,
-            duration: data.duration_sec || 0
+            duration: 0 // Will be filled by matching pdf_close
           });
         }
 
-        // Also capture duration from pdf_close events to pair with opens
+        // Pair pdf_close duration with the most recent matching pdf_open
         if (event.type === 'pdf_close') {
           const data = event.data || {};
-          const pdfUrl = data.url;
-          if (!pdfUrl) return;
+          const pdfTitle = data.title || 'Unknown PDF';
+          const closeDuration = data.reading_time_sec || data.duration_sec || 0;
 
-          const closeDuration = data.duration_sec || 0;
           if (closeDuration > 0) {
-            // Find the most recent matching pdf_open in allInteractions and update its duration
             for (let i = allInteractions.length - 1; i >= 0; i--) {
-              if (allInteractions[i].url === pdfUrl && allInteractions[i].duration === 0) {
+              if (allInteractions[i].title === pdfTitle && allInteractions[i].duration === 0) {
                 allInteractions[i].duration = closeDuration;
                 break;
               }
@@ -105,10 +101,15 @@ router.get('/:userId', async (req, res) => {
     // 3. Process Lists
     allInteractions.sort((a, b) => new Date(b.date) - new Date(a.date));
 
-    // Sort top content by count
-    const topContent = Object.values(pdfCounts)
+    // Top content from the pdfs_read map (cleaner than counting events)
+    const topContent = Object.entries(globalPdfsRead)
+      .map(([title, count]) => ({ title, count }))
       .sort((a, b) => b.count - a.count)
       .slice(0, 5);
+
+    // Total unique PDFs 
+    const uniquePdfsCount = Object.keys(globalPdfsRead).length;
+    const totalPdfsRead = Object.values(globalPdfsRead).reduce((sum, c) => sum + c, 0);
 
     // 4. Calculate Streak
     let streak = 0;
@@ -140,10 +141,11 @@ router.get('/:userId', async (req, res) => {
       period: period || 'all_time',
       metrics: {
         pdfs_read_count: totalPdfsRead,
-        unique_pdfs_count: Object.keys(pdfCounts).length,
+        unique_pdfs_count: uniquePdfsCount,
         reading_time_seconds: totalReadingTime,
         engagement_time_seconds: totalEngagementTime
       },
+      pdfs_read: globalPdfsRead,
       streak,
       trends,
       history: allInteractions.slice(0, 50),
@@ -157,4 +159,3 @@ router.get('/:userId', async (req, res) => {
 });
 
 module.exports = router;
-
