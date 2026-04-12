@@ -12,11 +12,12 @@ router.get('/:userId', async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // 1. Fetch Daily Stats Rows for Detailed Aggregates (PDFs, History)
+    // 1. Fetch Daily Stats Rows for Detailed Aggregates
+    // We filter by user_id column which is more stable than entity_id
     let query = supabase
       .from('user_daily_stats')
       .select('date, metrics')
-      .eq('entity_id', entityId)
+      .eq('user_id', userId)
       .order('date', { ascending: false });
 
     // Handle period logic
@@ -30,92 +31,68 @@ router.get('/:userId', async (req, res) => {
 
     const { data: dailyRows, error } = await query;
 
-    if (error) {
-      throw error;
-    }
+    if (error) throw error;
 
     // 2. Aggregate Data
-    let totalReadingTime = 0;     // seconds (accumulated from pdf_close durations)
-    let totalEngagementTime = 0;  // seconds
-    let allInteractions = [];
+    let totalReadingTime = 0;
+    let totalEngagementTime = 0;
+    const globalPdfsRead = {};    // { "Title": { count, time_sec } }
+    const history = [];
     const trends = {};
-    const globalPdfsRead = {};    // Merged pdfs_read map across all days
 
     (dailyRows || []).forEach(row => {
       const metrics = row.metrics || {};
-      const events = metrics.events || [];
-      const dayPdfsRead = metrics.pdfs_read || {};
+      // Fallback for different schema versions
+      const pdfData = metrics.pdf_counts || metrics.pdfs_read || {};
+      const readingSec = Number(metrics.total_reading_sec || metrics.reading_time_seconds || 0);
+      const engagementSec = Number(metrics.total_engagement_sec || metrics.engagement_time_seconds || 0);
 
-      // Add to trends for this date
+      totalReadingTime += readingSec;
+      totalEngagementTime += engagementSec;
+
+      // Aggregate Trends
       trends[row.date] = {
-        reading_time: metrics.reading_time_seconds || 0,
-        engagement_time: metrics.engagement_time_seconds || 0,
-        pdfs_read: Object.keys(dayPdfsRead).length
+        reading_time: readingSec,
+        engagement_time: engagementSec,
+        pdfs_count: Object.keys(pdfData).length
       };
 
-      // Summary totals — these are already accumulated per-day by the RPC
-      totalEngagementTime += (metrics.engagement_time_seconds || 0);
-      totalReadingTime += (metrics.reading_time_seconds || 0);
-
-      // Merge daily pdfs_read into global map
-      for (const [title, count] of Object.entries(dayPdfsRead)) {
-        if (globalPdfsRead[title]) {
-          globalPdfsRead[title] += (typeof count === 'number' ? count : 1);
+      // Aggregate PDF mapping
+      for (const [title, data] of Object.entries(pdfData)) {
+        if (!globalPdfsRead[title]) {
+          globalPdfsRead[title] = { count: 0, time_sec: 0 };
+        }
+        // Handle both simple counts and object-based data
+        if (typeof data === 'number') {
+          globalPdfsRead[title].count += data;
         } else {
-          globalPdfsRead[title] = (typeof count === 'number' ? count : 1);
+          globalPdfsRead[title].count += (data.count || 0);
+          globalPdfsRead[title].time_sec += (data.time_sec || data.duration_sec || 0);
         }
       }
 
-      // Process individual events for detailed interaction history
-      events.forEach(event => {
-        if (event.type === 'pdf_read' || event.type === 'pdf_open') {
-          const data = event.data || {};
-          const pdfTitle = data.title || 'Unknown PDF';
-
-          allInteractions.push({
-            title: pdfTitle,
-            date: event.ts || row.date,
-            type: event.type,
-            duration: 0 // Will be filled by matching pdf_close
-          });
-        }
-
-        // Pair pdf_close duration with the most recent matching pdf_open
-        if (event.type === 'pdf_close') {
-          const data = event.data || {};
-          const pdfTitle = data.title || 'Unknown PDF';
-          const closeDuration = data.reading_time_sec || data.duration_sec || 0;
-
-          if (closeDuration > 0) {
-            for (let i = allInteractions.length - 1; i >= 0; i--) {
-              if (allInteractions[i].title === pdfTitle && allInteractions[i].duration === 0) {
-                allInteractions[i].duration = closeDuration;
-                break;
-              }
-            }
-          }
-        }
-      });
+      // Populate history from aggregated daily map
+      for (const [title, data] of Object.entries(pdfData)) {
+        history.push({
+          title,
+          date: row.date,
+          count: typeof data === 'number' ? data : (data.count || 0),
+          reading_time_sec: typeof data === 'number' ? 0 : (data.time_sec || data.duration_sec || 0)
+        });
+      }
     });
 
-    // 3. Process Lists
-    allInteractions.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-    // Top content from the pdfs_read map (cleaner than counting events)
-    const topContent = Object.entries(globalPdfsRead)
-      .map(([title, count]) => ({ title, count }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5);
-
-    // Total unique PDFs 
-    const uniquePdfsCount = Object.keys(globalPdfsRead).length;
-    const totalPdfsRead = Object.values(globalPdfsRead).reduce((sum, c) => sum + c, 0);
-
-    // 4. Calculate Streak
+    // 3. Process streak
     let streak = 0;
     if (dailyRows && dailyRows.length > 0) {
-      const todayStr = new Date().toISOString().split('T')[0];
-      const yesterdayStr = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+      const today = new Date();
+      // Ensure we compare local dates strings
+      const todayStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`;
+      
+      const yesterday = new Date(today);
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+
       const mostRecentDate = dailyRows[0].date;
 
       if (mostRecentDate === todayStr || mostRecentDate === yesterdayStr) {
@@ -123,15 +100,14 @@ router.get('/:userId', async (req, res) => {
         let currentDate = new Date(mostRecentDate);
 
         for (let i = 1; i < dailyRows.length; i++) {
-          const prevDate = new Date(dailyRows[i].date);
-          const diffTime = Math.abs(currentDate - prevDate);
-          const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          const rowDate = new Date(dailyRows[i].date);
+          const diffDays = Math.round((currentDate - rowDate) / (1000 * 60 * 60 * 24));
 
           if (diffDays === 1) {
             streak++;
-            currentDate = prevDate;
+            currentDate = rowDate;
           } else {
-            break; // Gap found
+            break;
           }
         }
       }
@@ -140,16 +116,23 @@ router.get('/:userId', async (req, res) => {
     res.status(200).json({
       period: period || 'all_time',
       metrics: {
-        pdfs_read_count: totalPdfsRead,
-        unique_pdfs_count: uniquePdfsCount,
         reading_time_seconds: totalReadingTime,
-        engagement_time_seconds: totalEngagementTime
+        engagement_time_seconds: totalEngagementTime,
+        pdfs_read_count: Object.values(globalPdfsRead).reduce((sum, p) => sum + p.count, 0),
+        unique_pdfs_count: Object.keys(globalPdfsRead).length
       },
-      pdfs_read: globalPdfsRead,
       streak,
+      pdfs_read_list: Object.entries(globalPdfsRead).map(([title, val]) => ({
+        title,
+        ...val
+      })).sort((a, b) => b.time_sec - a.time_sec),
       trends,
-      history: allInteractions.slice(0, 50),
-      top_pdfs: topContent
+      history: history.sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 50),
+      // Direct compatibility with some frontend components
+      top_pdfs: Object.entries(globalPdfsRead)
+        .map(([title, val]) => ({ title, count: val.count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 5)
     });
 
   } catch (err) {

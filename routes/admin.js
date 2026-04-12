@@ -248,180 +248,34 @@ router.get('/reading-insights', async (req, res) => {
       return res.status(403).json({ error: 'Admin privileges required' });
     }
 
-    let rowsQuery = supabase
-      .from('user_daily_stats')
-      .select('entity_id, user_id, date, metrics');
+    // Optimized SQL-based insights
+    const { data: topPdfs, error: pdfsError } = await supabase.rpc('get_top_pdfs_v4');
+    const { data: topUsers, error: usersError } = await supabase.rpc('get_top_readers_v4');
 
-    if (!isAllTime) {
-      rowsQuery = rowsQuery
-        .gte('date', range.start.split('T')[0])
-        .lte('date', range.end.split('T')[0]);
+    if (pdfsError) {
+      console.error('RPC Error (top_pdfs):', pdfsError);
+      throw pdfsError;
+    }
+    if (usersError) {
+      console.error('RPC Error (top_users):', usersError);
+      throw usersError;
     }
 
-    const { data: rows, error: rowsError } = await rowsQuery;
-
-    if (rowsError) throw rowsError;
-
-    const pdfMap = new Map();
-    const userMap = new Map();
-    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-    for (const row of rows || []) {
-      const metrics = row.metrics || {};
-      const events = Array.isArray(metrics.events) ? metrics.events : [];
-      const rowReadingTimeSeconds = Number(metrics.reading_time_seconds) || 0;
-
-      const entityId = typeof row.entity_id === 'string' ? row.entity_id : null;
-      const normalizedUserId = row.user_id
-        || (entityId && entityId.startsWith('user:') ? entityId.slice(5) : null)
-        || (entityId && UUID_RE.test(entityId) ? entityId : null);
-      const normalizedAnonId = entityId && entityId.startsWith('anon:') ? entityId : null;
-      const entityParticipantId = normalizedUserId || normalizedAnonId;
-
-      const participantType = normalizedAnonId ? 'anon' : 'user';
-
-      if (entityParticipantId && !userMap.has(entityParticipantId)) {
-        userMap.set(entityParticipantId, {
-          user_id: participantType === 'user' ? entityParticipantId : null,
-          anon_id: participantType === 'anon' ? entityParticipantId : null,
-          participant_id: entityParticipantId,
-          participant_type: participantType,
-          reading_time_seconds: 0,
-          pdf_reads: 0,
-          unique_pdfs: new Set()
-        });
-      }
-
-      if (entityParticipantId && rowReadingTimeSeconds > 0) {
-        const userAgg = userMap.get(entityParticipantId);
-        if (userAgg) {
-          // Use row-level aggregate to match Supabase query semantics exactly.
-          userAgg.reading_time_seconds += rowReadingTimeSeconds;
-        }
-      }
-
-      for (const event of events) {
-        const type = event && event.type;
-        // PDF views are counted from open events.
-        if (type !== 'pdf_open') continue;
-
-        const identity = resolvePdfIdentityFromEvent(event.data || {});
-        if (!identity) continue;
-        const pdfKey = identity.key;
-
-        if (!pdfMap.has(pdfKey)) {
-          pdfMap.set(pdfKey, {
-            url: identity.url,
-            key: pdfKey,
-            title: identity.title,
-            reads: 0,
-            readers: new Set()
-          });
-        }
-
-        const pdfAgg = pdfMap.get(pdfKey);
-        pdfAgg.reads += 1;
-
-        if ((!pdfAgg.title || pdfAgg.title === 'Unknown PDF' || pdfAgg.title === 'PDF Document') && identity.title) {
-          pdfAgg.title = identity.title;
-        }
-
-        if (!pdfAgg.url && identity.url) {
-          pdfAgg.url = identity.url;
-        }
-
-        if (entityParticipantId) {
-          pdfAgg.readers.add(entityParticipantId);
-          const userAgg = userMap.get(entityParticipantId);
-          if (userAgg) {
-            userAgg.pdf_reads += 1;
-            userAgg.unique_pdfs.add(pdfKey);
-          }
-        }
-      }
+    // Filter by search if provided
+    let filteredPdfs = topPdfs || [];
+    if (pdfSearch) {
+      const search = pdfSearch.toLowerCase();
+      filteredPdfs = filteredPdfs.filter(pdf => String(pdf.title || '').toLowerCase().includes(search));
     }
-
-    const userIds = Array.from(userMap.values())
-      .filter((u) => u.participant_type === 'user' && u.user_id && UUID_RE.test(String(u.user_id)))
-      .map((u) => u.user_id);
-    let usersById = new Map();
-
-    if (userIds.length > 0) {
-      const { data: usersData } = await supabase
-        .from('users')
-        .select('id, username, display_name')
-        .in('id', userIds);
-
-      usersById = new Map((usersData || []).map((u) => [u.id, u]));
-    }
-
-    const topPdfsAll = Array.from(pdfMap.values())
-      .map((item) => {
-        let derivedTitle = item.title;
-        if (!derivedTitle || derivedTitle === 'Unknown PDF' || derivedTitle === 'PDF Document') {
-          if (item.url) {
-            try {
-              const last = item.url.split('/').pop() || '';
-              derivedTitle = decodeURIComponent(last.split('?')[0]).replace(/\.pdf$/i, '') || 'PDF Document';
-            } catch {
-              derivedTitle = 'PDF Document';
-            }
-          } else {
-            derivedTitle = item.key.startsWith('title:')
-              ? item.key.slice('title:'.length)
-              : 'PDF Document';
-          }
-        }
-
-        return {
-          url: item.url || item.key,
-          title: derivedTitle,
-          reads: item.reads,
-          unique_readers: item.readers.size
-        };
-      })
-      .sort((a, b) => b.reads - a.reads);
-
-    const normalizedPdfSearch = typeof pdfSearch === 'string' ? pdfSearch.trim().toLowerCase() : '';
-    const topPdfs = (normalizedPdfSearch
-      ? topPdfsAll.filter((item) => String(item.title || '').toLowerCase().includes(normalizedPdfSearch))
-      : topPdfsAll)
-      .slice(0, limit);
-
-    const topUsers = Array.from(userMap.values())
-      .filter((item) => item.reading_time_seconds > 0 || item.pdf_reads > 0)
-      .map((item) => {
-        const profile = item.user_id ? (usersById.get(item.user_id) || {}) : {};
-        const anonLabel = item.anon_id || item.participant_id;
-        return {
-          user_id: item.user_id,
-          anon_id: item.anon_id,
-          participant_id: item.participant_id,
-          participant_type: item.participant_type,
-          username: profile.username || null,
-          display_name: profile.display_name || profile.username || anonLabel,
-          reading_time_seconds: item.reading_time_seconds,
-          reading_time_human: formatDurationCompact(item.reading_time_seconds),
-          pdf_reads: item.pdf_reads,
-          unique_pdfs_count: item.unique_pdfs.size
-        };
-      })
-      .sort((a, b) => {
-        if (b.reading_time_seconds !== a.reading_time_seconds) {
-          return b.reading_time_seconds - a.reading_time_seconds;
-        }
-        return b.pdf_reads - a.pdf_reads;
-      })
-      .slice(0, limit);
 
     res.json({
       period: selectedPeriod,
       range: isAllTime ? null : { start: range.start, end: range.end },
       filters: {
-        pdfSearch: normalizedPdfSearch || null
+        pdfSearch: pdfSearch || null
       },
-      top_pdfs: topPdfs,
-      top_users: topUsers
+      top_pdfs: filteredPdfs.slice(0, limit),
+      top_users: (topUsers || []).slice(0, limit)
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
